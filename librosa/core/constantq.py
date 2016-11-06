@@ -15,7 +15,7 @@ from .. import filters
 from .. import util
 from ..util.exceptions import ParameterError
 
-__all__ = ['cqt', 'hybrid_cqt', 'pseudo_cqt']
+__all__ = ['cqt', 'hybrid_cqt', 'pseudo_cqt', 'icqt']
 
 
 @cache(level=20)
@@ -499,6 +499,145 @@ def pseudo_cqt(y, sr=22050, hop_length=512, fmin=None, n_bins=84,
         C *= np.sqrt(lengths[:, np.newaxis] / n_fft)
 
     return C
+
+
+@cache(level=40)
+def icqt(C, sr=22050, hop_length=512, fmin=None,
+         bins_per_octave=12,
+         tuning=0.0,
+         filter_scale=1,
+         norm=1,
+         window='hann',
+         scale=True):
+    '''Compute the inverse constant-Q transform.
+
+    Parameters
+    ----------
+    C : np.ndarray, [shape=(n_bins, n_frames)]
+        Constant-Q representation as produced by `core.cqt`
+
+    hop_length : int > 0 [scalar]
+        number of samples between successive frames
+
+    fmin : float > 0 [scalar]
+        Minimum frequency. Defaults to C1 ~= 32.70 Hz
+
+    tuning : float in `[-0.5, 0.5)` [scalar]
+        Tuning offset in fractions of a bin (cents).
+
+    filter_scale : float > 0 [scalar]
+        Filter scale factor. Small values (<1) use shorter windows
+        for improved time resolution.
+
+    norm : {inf, -inf, 0, float > 0}
+        Type of norm to use for basis function normalization.
+        See `librosa.util.normalize`.
+
+    window : str, tuple, number, or function
+        Window specification for the basis filters.
+        See `filters.get_window` for details.
+
+    scale : bool
+        If `True`, scale the CQT response by square-root the length
+        of each channel's filter. This is analogous to `norm='ortho'` in FFT.
+
+        If `False`, do not scale the CQT. This is analogous to `norm=None`
+        in FFT.
+
+    Returns
+    -------
+    y : np.ndarray, [shape=(n_samples), dtype=np.float]
+        Audio time-series reconstructed from the CQT representation.
+
+    See Also
+    --------
+    librosa.core.cqt
+
+    Notes
+    -----
+    This function caches at level 40.
+    '''
+    n_bins, n_frames = C.shape
+    n_octaves = int(np.ceil(float(n_bins) / bins_per_octave))
+
+    if fmin is None:
+        fmin = note_to_hz('C1')
+
+    freqs = cqt_frequencies(n_bins,
+                            fmin,
+                            bins_per_octave=bins_per_octave,
+                            tuning=tuning)[-bins_per_octave:]
+
+    fmin_t = np.min(freqs)
+
+    # Make the filter bank
+    f, lengths = filters.constant_q(sr=sr,
+                                    fmin=fmin_t,
+                                    n_bins=bins_per_octave,
+                                    bins_per_octave=bins_per_octave,
+                                    filter_scale=filter_scale,
+                                    tuning=tuning,
+                                    norm=norm,
+                                    window=window)
+
+    if scale:
+        Cnorm = np.ones(n_bins)[:, np.newaxis]
+    else:
+        Cnorm = filters.constant_q_lengths(sr=sr,
+                                           fmin=fmin,
+                                           n_bins=n_bins,
+                                           bins_per_octave=bins_per_octave,
+                                           filter_scale=filter_scale,
+                                           tuning=tuning,
+                                           window=window)[:, np.newaxis]**0.5
+
+    f = f / np.sqrt(lengths[:, np.newaxis])
+
+    n_trim = f.shape[1] // 2
+
+    # Hermitian the filters and sparsify
+    f = util.sparsify_rows(f)
+
+    y = None
+
+    # This seems to be missing the top octave
+    for octave in range(n_octaves - 1, -1, -1):
+        # Compute the slice index for the current octave
+        slice_ = slice(-(octave+1) * bins_per_octave - 1,
+                       -(octave) * bins_per_octave - 1)
+
+        # Project onto the basis
+        C_ = C[slice_]
+        fb = f[-C_.shape[0]:].conj().T
+
+        Cf = fb.dot(C_ / Cnorm[slice_])
+
+        # Overlap-add the responses
+        y_oct = np.zeros(int(f.shape[1] +
+                             (2.0**(-octave) * hop_length * n_frames)),
+                         dtype=f.dtype)
+
+        for i in range(Cf.shape[1]):
+            sl = slice(int(i * hop_length * 2.0**(-octave)),
+                       int(i * hop_length * 2.0**(-octave) + Cf.shape[0]))
+            y_oct[sl] += Cf[:, i]
+
+        if y is None:
+            y = y_oct
+            continue
+
+        # Up-sample the previous buffer and add in the new one
+        y = (audio.resample(y.real, 1, 2, scale=True) +
+             1.j * audio.resample(y.imag, 1, 2, scale=True))
+
+        y = y[n_trim:-n_trim] / np.sqrt(2) + y_oct
+
+    # Chop down the length
+    y = util.fix_length(y.real, f.shape[1] + hop_length * C.shape[1])
+    y *= 2.0**n_octaves
+
+    # Trim off the center-padding
+    return np.ascontiguousarray(y[n_trim:-n_trim])
 
 
 @cache(level=10)
