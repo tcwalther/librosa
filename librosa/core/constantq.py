@@ -570,6 +570,9 @@ def icqt(C, sr=22050, hop_length=512, fmin=None,
 
     fmin_t = np.min(freqs)
 
+    # Note: if using f-hermitian instead of pinv(f),
+    # the norm should be flipped to its dual (1<->inf, 2<->2, etc)
+
     # Make the filter bank
     f, lengths = filters.constant_q(sr=sr,
                                     fmin=fmin_t,
@@ -630,11 +633,10 @@ def icqt(C, sr=22050, hop_length=512, fmin=None,
         y = (audio.resample(y.real, 1, 2, scale=True) +
              1.j * audio.resample(y.imag, 1, 2, scale=True))
 
-        y = y[n_trim:-n_trim] / np.sqrt(2) + y_oct
+        y = y[n_trim:-n_trim] / 2.0 + y_oct * np.sqrt(2)
 
     # Chop down the length
     y = util.fix_length(y.real, f.shape[1] + hop_length * C.shape[1])
-    y *= 2.0**n_octaves
 
     # Trim off the center-padding
     return np.ascontiguousarray(y[n_trim:-n_trim])
